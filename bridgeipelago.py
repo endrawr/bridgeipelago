@@ -5,7 +5,7 @@
 # | |_/ /| |   | || (_| || (_| ||  __/| || |_) ||  __/| || (_| || (_| || (_) |
 # \____/ |_|   |_| \__,_| \__, | \___||_|| .__/  \___||_| \__,_| \__, | \___/ 
 #                          __/ |         | |                      __/ |       
-#                         |___/          |_|                     |___/  v1.3.0
+#                         |___/          |_|                     |___/  v2.0.0-pr1
 #
 # An Archipelago Discord Bot
 #                - By the Zajcats
@@ -17,7 +17,7 @@ import typing
 import uuid
 import os
 import sys
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from enum import Enum
 import glob
 import random
@@ -35,7 +35,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 #Websocket Dependencies
-from websocket import WebSocketApp, enableTrace
+from websockets.sync.client import connect, ClientConnection
 
 #Discord Dependencies
 from discord.ext import tasks
@@ -74,6 +74,7 @@ LoggingDirectory = os.getcwd() + os.getenv('LoggingDirectory')
 RegistrationDirectory = os.getcwd() + os.getenv('PlayerRegistrationDirectory')
 ItemQueueDirectory = os.getcwd() + os.getenv('PlayerItemQueueDirectory')
 ArchDataDirectory = os.getcwd() + os.getenv('ArchipelagoDataDirectory')
+QueueOverclock = float(os.getenv('QueueOverclock'))
 JoinMessage = os.getenv('JoinMessage')
 DebugMode = os.getenv('DebugMode')
 DiscordJoinOnly = os.getenv('DiscordJoinOnly')
@@ -94,7 +95,8 @@ ArchRawData = ArchDataDirectory + 'ArchRawData.txt'
 # Global Variable Declaration
 DumpJSON = []
 ConnectionPackage = []
-ReconnectionTimer = 10
+ReconnectionTimer = 5
+EnvPath = os.getcwd() + "/.env"
 
 if(DebugMode == "true"):
     WSdbug = True
@@ -167,9 +169,9 @@ class TrackerClient:
         server_uri: str,
         port: str,
         slot_name: str,
-        on_death_link: callable = None, 
-        on_item_send: callable = None, 
-        on_chat_send: callable = None, 
+        on_death_link: callable = None,
+        on_item_send: callable = None,
+        on_chat_send: callable = None,
         on_datapackage: callable = None,
         verbose_logging: bool = False,
         **kwargs: typing.Any
@@ -182,25 +184,66 @@ class TrackerClient:
         self.on_chat_send = on_chat_send
         self.on_datapackage = on_datapackage
         self.verbose_logging = verbose_logging
-        self.web_socket_app_kwargs = kwargs
+        self.ap_connection_kwargs = kwargs
         self.uuid: int = uuid.getnode()
-        self.wsapp: WebSocketApp = None
+        self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
 
-    def start(self) -> None:
-        print("Attempting to open an Archipelago MultiServer websocket connection in a new thread.")
-        enableTrace(self.verbose_logging)
-        self.wsapp = WebSocketApp(
-            f'{self.server_uri}:{self.port}',
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
-            **self.web_socket_app_kwargs,
-        )
+    def run(self):
+        """Handles incoming messages from the Archipelago MultiServer."""
+        DebugMode = os.getenv('DebugMode')
+        for RawMessage in self.ap_connection:
 
-        self.socket_thread = Thread(target=self.wsapp.run_forever)
-        self.socket_thread.daemon = True
-        self.socket_thread.start()
+            if(DebugMode == "true"):
+                print("==RawMessage==")
+                print(RawMessage)
+                print("=====")
+
+            for i in range(len(json.loads(RawMessage))):
+
+                args: dict = json.loads(RawMessage)[i]
+                cmd = args.get('cmd')
+
+                if(DebugMode == "true"):
+                    print("==Args==")
+                    print(args)
+                    print("=====")
+
+                if cmd == self.MessageCommand.ROOM_INFO.value:
+                    self.send_connect()
+                    self.get_datapackage()
+                elif cmd == self.MessageCommand.DATA_PACKAGE.value:
+                    WriteDataPackage(args)
+                elif cmd == self.MessageCommand.CONNECTED.value:
+                    WriteConnectionPackage(args)
+                    print("Connected to server.")
+                elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
+                    print("Connection refused by server - check your slot name / port / whatever, and try again.")
+                    print(args)
+                    seppuku_queue.put(args)
+                elif cmd == self.MessageCommand.PRINT_JSON.value:
+                    if args.get('type') == 'ItemSend' and self.on_item_send:
+                        self.on_item_send(args)
+                    elif args.get('type') == 'Chat':
+                        if EnableChatMessages == "true" and self.on_chat_send:
+                            self.on_chat_send(args)
+                    elif args.get('type') == 'ServerChat':
+                        if EnableServerChatMessages == "true" and self.on_chat_send:
+                             self.on_chat_send(args)
+                    elif args.get('type') == 'Goal':
+                        if EnableGoalMessages == "true" and self.on_chat_send:
+                            self.on_chat_send(args)
+                    elif args.get('type') == 'Release':
+                        if EnableReleaseMessages == "true" and self.on_chat_send:
+                            self.on_chat_send(args)
+                    elif args.get('type') == 'Collect':
+                        if EnableCollectMessages == "true" and self.on_chat_send:
+                            self.on_chat_send(args)
+                    elif args.get('type') == 'Countdown':
+                        if EnableCountdownMessages == "true" and self.on_chat_send:
+                            self.on_chat_send(args)
+                elif 'DeathLink' in args.get('tags', []) and self.on_death_link:
+                    self.on_death_link(args)
 
     def on_error(self, string, opcode) -> None:
         if self.verbose_logging:
@@ -208,80 +251,9 @@ class TrackerClient:
             print(f"error string: {string}")
             print(f"error opcode: {opcode}")
         websocket_queue.put("!! Tracker Error...")
-        sys.exit()
 
-    def on_close(self, string, opcode, flag) -> None:
-        if self.verbose_logging:
-            print(f"closed self: {self}")
-            print(f"closed string: {string}")
-            print(f"closed opcode: {opcode}") #1001 used for closure initiated by the server
-            print(f"closed opcode: {flag}")
-        websocket_queue.put("!! Tracker Closed...")
-        sys.exit()
-
-    def on_message(self, wsapp: WebSocketApp, RawMessage: str) -> None:
-        """Handles incoming messages from the Archipelago MultiServer."""
-
-        DebugMode = os.getenv('DebugMode')
-        if(DebugMode == "true"):
-            print("==RawMessage==")
-            print(RawMessage)
-            print("=====")
-
-        for i in range(len(json.loads(RawMessage))):
-
-            args: dict = json.loads(RawMessage)[i]
-            cmd = args.get('cmd')
-
-            if(DebugMode == "true"):
-                print("==Args==")
-                print(args)
-                print("=====")
-
-            if cmd == self.MessageCommand.ROOM_INFO.value:
-                self.send_connect()
-                self.get_datapackage()
-            elif cmd == self.MessageCommand.DATA_PACKAGE.value:
-                WriteDataPackage(args)
-            elif cmd == self.MessageCommand.CONNECTED.value:
-                print("-- Writing room-connection info.")
-                WriteConnectionPackage(args)
-                print("-- Connected to server.")
-            elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
-                print("!! Connection refused by the AP server - check your slot name / port / whatever, and try again.")
-                print(args)
-                seppuku_queue.put(args)
-                exit()
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'ItemSend':
-                if self.on_item_send:
-                    self.on_item_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'Chat':
-                if EnableChatMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'ServerChat':
-                if EnableServerChatMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'Goal':
-                if EnableGoalMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'Release':
-                if EnableReleaseMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'Collect':
-                if EnableCollectMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.PRINT_JSON.value and args.get('type') == 'Countdown':
-                if EnableCountdownMessages == "true":
-                    if self.on_chat_send:
-                        self.on_chat_send(args)
-            elif cmd == self.MessageCommand.BOUNCED.value and 'DeathLink' in args.get('tags', []):
-                if self.on_death_link:
-                    self.on_death_link(args)
+    def on_close(self) -> None:
+        websocket_queue.put("Tracker Closed...")
 
     def send_connect(self) -> None:
         print("-- Sending `Connect` packet to log in to server.")
@@ -308,10 +280,31 @@ class TrackerClient:
             self.send_message(payload)
 
     def send_message(self, message: dict) -> None:
-        self.wsapp.send(json.dumps([message]))
+        self.ap_connection.send(json.dumps([message]))
 
     def stop(self) -> None:
-        self.wsapp.close()
+        self.ap_connection.close()
+
+    def start(self) -> None:
+        print("Attempting to open an Archipelago MultiServer websocket connection in a new thread.")
+        if not port_queue.empty():
+            while not port_queue.empty():
+                tempport = port_queue.get()
+            self.port = tempport
+        try:
+            self.ap_connection = connect(
+                f'{self.server_uri}:{self.port}',
+                max_size=None,
+                **self.ap_connection_kwargs
+            )
+            self.socket_thread = Thread(target=self.run)
+            self.socket_thread.daemon = True
+            self.socket_thread.start()
+        except Exception as e:
+            print("Error while trying to connect to Archipelago MultiServer:")
+            print(e)
+            websocket_queue.put("!! Tracker start error...")
+
 
 
 ## DISCORD EVENT HANDLERS + CORE FUNTION
@@ -356,6 +349,9 @@ async def on_message(message):
         Status = await Command_ClearReg(str(message.author))
         await SendMainChannelMessage(Status)
 
+    if message.content.startswith('$listreg'):
+        await Command_ListRegistrations(message.author)
+
     # Opens a discord DM with the user, and fires off the Katchmeup process
     # When the user asks, catch them up on checks they're registered for
     ## Yoinks their registration file, scans through it, then find the related ItemQueue file to scan through 
@@ -390,6 +386,15 @@ async def on_message(message):
     if message.content.startswith('$archinfo'):
         await Command_ArchInfo(message)
 
+    if message.content.startswith('$setenv'):
+        pair = ((message.content).split('$setenv '))[1].split(' ')
+        rtrnmessage = SetEnvVariable(pair[0], pair[1])
+        await SendMainChannelMessage(rtrnmessage)
+
+    if message.content.startswith('$reloadbot'):
+        ReloadBot()
+        await SendMainChannelMessage("Reloading bot... Please wait.")
+
 @tasks.loop(seconds=900)
 async def CheckArchHost():
     if SelfHostNoWeb == "true":
@@ -415,7 +420,7 @@ async def CheckArchHost():
         except:
             await DebugChannel.send("ERROR IN CHECKARCHHOST <@"+DiscordAlertUserID+">")
 
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=QueueOverclock)
 async def ProcessItemQueue():
     try:
         if item_queue.empty():
@@ -492,7 +497,7 @@ async def ProcessItemQueue():
         print(e)
         await SendDebugChannelMessage("Error In Item Queue Process")
 
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=QueueOverclock)
 async def ProcessDeathQueue():
     if death_queue.empty():
         return
@@ -513,7 +518,7 @@ async def ProcessDeathQueue():
         else:
             return
 
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=QueueOverclock)
 async def ProcessChatQueue():
     if chat_queue.empty():
         return
@@ -590,30 +595,56 @@ async def SendDMMessage(message,user):
 
 async def Command_Register(Sender:str, ArchSlot:str):
     try:
-        RegistrationFile = RegistrationDirectory + Sender + ".csv"
-        RegistrationContent = ArchSlot + "\n"
-        # Generate the Registration File if it doesn't exist
-        o = open(RegistrationFile, "a")
-        o.close()
-        # Get contents of the registration file and save it to 'line'
-        o = open(RegistrationFile, "r")
-        line = o.read()
-        o.close()
-        # Check the registration file for ArchSlot, if they are not registered; do so. If they already are; tell them.
-        if not ArchSlot in line:
-            o = open(RegistrationFile, "a")
-            o.write(RegistrationContent)
+        #Compile the Registration File's path
+        RegistrationFile = RegistrationDirectory + Sender + ".json"
+
+        # If the file does not exist, we create it to prevent indexing issues
+        if not os.path.exists(RegistrationFile):
+            o = open(RegistrationFile, "w")
+            o.write("[]")
             o.close()
+
+        # Load the registration file
+        RegistrationContents = json.load(open(RegistrationFile, "r"))
+
+        # Check the registration file for ArchSlot, if they are not registered; do so. If they already are; tell them.
+        if not ArchSlot in RegistrationContents:
+
+            RegistrationContents.append(ArchSlot)
+            json.dump(RegistrationContents, open(RegistrationFile, "w"))
             return "You've been registered for " + ArchSlot + "!"
         else:
             return "You're already registered for that slot."
     except Exception as e:
         print(e)
         await DebugChannel.send("ERROR IN REGISTER <@"+DiscordAlertUserID+">")
+        return "Critical error in REGISTER :("
+
+async def Command_ListRegistrations(Sender):
+    try:
+        RegistrationFile = RegistrationDirectory + str(Sender) + ".json"
+
+        # If the file does not exist, we create it to prevent indexing issues
+        if not os.path.exists(RegistrationFile):
+            o = open(RegistrationFile, "w")
+            o.write("[]")
+            o.close()
+
+        RegistrationContents = json.load(open(RegistrationFile, "r"))
+        if len(RegistrationContents) == 0:
+            await Sender.send("You are not registered for any slots :(")
+        else:
+            Message = "**You are registered for:**\n"
+            for slots in RegistrationContents:
+                Message = Message + slots + "\n"
+            await Sender.send(Message)
+    except Exception as e:
+        print(e)
+        await DebugChannel.send("ERROR IN LISTREG <@"+DiscordAlertUserID+">")
 
 async def Command_ClearReg(Sender:str):
     try:
-        RegistrationFile = RegistrationDirectory + Sender + ".csv"
+        RegistrationFile = RegistrationDirectory + Sender + ".json"
         if not os.path.exists(RegistrationFile):
             return "You're not registered for any slots :("
         os.remove(RegistrationFile)
@@ -624,14 +655,12 @@ async def Command_ClearReg(Sender:str):
 
 async def Command_KetchMeUp(User):
     try:
-        RegistrationFile = RegistrationDirectory + str(User) + ".csv"
+        RegistrationFile = RegistrationDirectory + str(User) + ".json"
         if not os.path.isfile(RegistrationFile):
             await User.send("You've not registered for a slot : (")
         else:
-            r = open(RegistrationFile,"r")
-            RegistrationLines = r.readlines()
-            r.close()
-            for reglines in RegistrationLines:
+            RegistrationContents = json.load(open(RegistrationFile, "r"))
+            for reglines in RegistrationContents:
                 ItemQueueFile = ItemQueueDirectory + reglines.strip() + ".csv"
                 if not os.path.isfile(ItemQueueFile):
                     await User.send("There are no items for " + reglines.strip() + " :/")
@@ -679,7 +708,8 @@ async def Command_KetchMeUp(User):
                         await User.send(ketchupmessage)
                         ketchupmessage = "```"
                 ketchupmessage = ketchupmessage + "```"
-                await User.send(ketchupmessage)
+                if not ketchupmessage == "``````":
+                    await User.send(ketchupmessage)
     except Exception as e:
         print(e)
         await DebugChannel.send("ERROR IN KETCHMEUP <@"+DiscordAlertUserID+">")
@@ -702,7 +732,8 @@ async def Command_GroupCheck(DMauthor, game):
                     await DMauthor.send(ketchupmessage)
                     ketchupmessage = "```"
             ketchupmessage = ketchupmessage + "```"
-            await DMauthor.send(ketchupmessage)
+            if not ketchupmessage == "``````":
+                await DMauthor.send(ketchupmessage)
     except Exception as e:
         print(e)
         await DebugChannel.send("ERROR IN GROUPCHECK <@"+DiscordAlertUserID+">")
@@ -724,14 +755,12 @@ async def Command_Hints(player):
             rows = slots.find_all('tr')
 
 
-        RegistrationFile = RegistrationDirectory + player.name + ".csv"
+        RegistrationFile = RegistrationDirectory + player.name + ".json"
         if not os.path.isfile(RegistrationFile):
             await player.dm_channel.send("You've not registered for a slot : (")
         else:
-            r = open(RegistrationFile,"r")
-            RegistrationLines = r.readlines()
-            r.close()
-            for reglines in RegistrationLines:
+            RegistrationContents = json.load(open(RegistrationFile, "r"))
+            for reglines in RegistrationContents:
 
                 message = "**Here are all of the hints assigned to "+ reglines.strip() +":**"
                 await player.dm_channel.send(message)
@@ -815,7 +844,8 @@ async def Command_Hints(player):
 
                 # Caps off the message
                 checkmessage = checkmessage + "```"
-                await player.dm_channel.send(checkmessage)
+                if not checkmessage == "``````":
+                    await player.send(checkmessage)
     except Exception as e:
         print(e)
         await DebugChannel.send("ERROR IN HINTLIST <@"+DiscordAlertUserID+">")
@@ -1234,7 +1264,20 @@ def SpecialFormat(text,color,format):
 
     itext =  "\u001b[" + str(iformat) + ";" + str(icolor) + "m" + text + "\u001b[0m"
     return itext
-    
+
+def SetEnvVariable(key, value):
+    if key not in ["ArchipelagoPort"]:
+        return "Invalid key. Only 'ArchipelagoPort' can be set."
+    else:
+        if key == "ArchipelagoPort":
+            global ArchPort
+            ArchPort = value
+            port_queue.put(value)
+        set_key(dotenv_path=EnvPath, key_to_set=key, value_to_set=value)
+        return "Key '" + key + "' set to '" + value + "'!"
+
+def ReloadBot():
+    websocket_queue.put("Discord requested the bot to be reloaded!")
 
 async def CancelProcess():
     return 69420
@@ -1249,6 +1292,7 @@ chat_queue = Queue()
 seppuku_queue = Queue()
 websocket_queue = Queue()
 lottery_queue = Queue()
+port_queue = Queue()
 
 ## Threadded async functions
 if(DiscordJoinOnly == "false"):
@@ -1263,11 +1307,15 @@ if(DiscordJoinOnly == "false"):
         on_item_send=lambda args : item_queue.put(args)
     )
     # Start the tracker client in a seperate thread then sleep for 5 seconds to allow the datapackage to download.
-    tracker_client.start()
+    try:
+        tracker_client.start()
+    except Exception as e:
+        print("!!! Tracker can't start!")
+        seppuku_queue.put("Tracker Client can't start! Seppuku initiated.")
     time.sleep(5)
 
     # If there is a critical error in the tracker_client, kill the script.
-    if not seppuku_queue.empty():
+    if not seppuku_queue.empty() or not websocket_queue.empty():
         print("!! Seppuku Initiated - Goodbye Friend")
         exit(1)
 
@@ -1295,6 +1343,8 @@ if(DiscordJoinOnly == "false"):
 
 # The run method is blocking, so it will keep the program running
 def main():
+    global ReconnectionTimer
+    global ArchPort
     DiscordThread = Process(target=Discord)
     DiscordThread.start()
 
@@ -1309,8 +1359,16 @@ def main():
             while not websocket_queue.empty():
                 SQMessage = websocket_queue.get()
                 print(SQMessage)
+            print("Stopping client...")
+            try:
+                tracker_client.stop()
+            except Exception as e:
+                print("!!! Tracker Client can't stop!")
+                print(e)
             print("Restarting tracker client in ", ReconnectionTimer, "seconds...")
             time.sleep(ReconnectionTimer)
+
+            # Reset tracker_client with new environment variables
             tracker_client.start()
 
             if ReconnectionTimer < 120:
